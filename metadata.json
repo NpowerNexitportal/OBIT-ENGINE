@@ -1,0 +1,6 @@
+{
+  "name": "Obituary & Accident Trends Dashboard",
+  "description": "Monitors Google Trends and News for breakout obituary and accident reports globally.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
