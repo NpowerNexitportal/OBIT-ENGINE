@@ -3,13 +3,37 @@ import { createServer as createViteServer } from "vite";
 import path from "path";
 import cors from "cors";
 import Parser from "rss-parser";
-// import googleTrends from "google-trends-api"; // wait, usually requires default import or require
+import { MongoClient } from "mongodb";
+import { createClient } from "@supabase/supabase-js";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 app.use(cors());
+app.use(express.json());
 
 const parser = new Parser();
+
+// Database Clients
+const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_DB = process.env.MONGODB_DB || "obituary_api";
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+
+let mongoClient: MongoClient | null = null;
+let supabase: any = null;
+
+if (MONGODB_URI) {
+  mongoClient = new MongoClient(MONGODB_URI);
+  mongoClient.connect().then(() => console.log("Connected to MongoDB")).catch(err => console.error("MongoDB connection error:", err));
+}
+
+if (SUPABASE_URL && SUPABASE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+  console.log("Supabase client initialized");
+}
 
 // Types
 interface TrendResult {
@@ -46,8 +70,6 @@ const KEYWORDS = [
 
 async function fetchGoogleNews(country: string, timeframe: string): Promise<TrendResult[]> {
   try {
-    // Determine hl and ceid based on country
-    // Simple mapping
     const localeMap: Record<string, string> = {
       'US': 'en-US', 'CA': 'en-CA', 'GB': 'en-GB', 'NG': 'en-NG', 'ZA': 'en-ZA',
       'AU': 'en-AU', 'IN': 'en-IN', 'KE': 'en-KE', 'DE': 'de-DE', 'FR': 'fr-FR'
@@ -58,10 +80,8 @@ async function fetchGoogleNews(country: string, timeframe: string): Promise<Tren
     const gl = country;
     const ceid = `${country}:${locale.split('-')[0]}`;
     
-    // Timeframe logic. RSS query allows `when:1h`, `when:24h`
     const when = timeframe === '1h' ? '1h' : timeframe === '2h' ? '2h' : timeframe === '4h' ? '4h' : '24h';
     
-    // We will do a generic query combining some keywords
     const q = encodeURIComponent(`(obituary OR "passed away" OR accident OR "fatal crash" OR "found dead") when:${when}`);
     const url = `https://news.google.com/rss/search?q=${q}&hl=${hl}&gl=${gl}&ceid=${ceid}`;
     
@@ -73,7 +93,6 @@ async function fetchGoogleNews(country: string, timeframe: string): Promise<Tren
       const pubTime = item.pubDate ? new Date(item.pubDate).getTime() : Date.now();
       const ageHours = (Date.now() - pubTime) / (1000 * 60 * 60);
       
-      // Basic scoring algorithm based on recency and keyword strength
       let score = 10;
       const titleLower = (item.title || "").toLowerCase();
       
@@ -81,10 +100,8 @@ async function fetchGoogleNews(country: string, timeframe: string): Promise<Tren
       else if (ageHours < 1) score += 30;
       else if (ageHours < 2) score += 15;
       
-      let keywordCount = 0;
       KEYWORDS.forEach(kw => {
         if (titleLower.includes(kw.toLowerCase())) {
-          keywordCount++;
           score += 10;
         }
       });
@@ -106,13 +123,44 @@ async function fetchGoogleNews(country: string, timeframe: string): Promise<Tren
       });
     }
     
-    // Sort by chronological order / newest first
     results.sort((a, b) => new Date(b.publishedTime).getTime() - new Date(a.publishedTime).getTime());
     
     return results;
   } catch (error) {
     console.error('Error fetching Google News:', error);
     return [];
+  }
+}
+
+async function saveToDatabases(results: TrendResult[]) {
+  if (mongoClient) {
+    try {
+      const db = mongoClient.db(MONGODB_DB);
+      const collection = db.collection("trending_keywords");
+      
+      // Upsert by ID to avoid duplicates
+      for (const res of results) {
+        await collection.updateOne(
+          { id: res.id },
+          { $set: { ...res, updated_at: new Date() } },
+          { upsert: true }
+        );
+      }
+    } catch (err) {
+      console.error("Error saving to MongoDB:", err);
+    }
+  }
+
+  if (supabase) {
+    try {
+      const { error } = await supabase
+        .from('trending_keywords')
+        .upsert(results.map(r => ({ ...r, updated_at: new Date() })), { onConflict: 'id' });
+      
+      if (error) throw error;
+    } catch (err) {
+      console.error("Error saving to Supabase:", err);
+    }
   }
 }
 
@@ -130,10 +178,9 @@ app.get("/api/trends", async (req, res) => {
     
     const newsResults = await fetchGoogleNews(country, timeframe);
     
-    // Sort by published time descending
-    newsResults.sort((a, b) => new Date(b.publishedTime).getTime() - new Date(a.publishedTime).getTime());
+    // Save to databases in background
+    saveToDatabases(newsResults).catch(console.error);
     
-    // Send at least 10 results
     res.json(newsResults);
   } catch (err) {
     res.status(500).json({ error: String(err) });
@@ -141,7 +188,6 @@ app.get("/api/trends", async (req, res) => {
 });
 
 async function startServer() {
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -151,7 +197,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*all", (req, res) => {
+    app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
